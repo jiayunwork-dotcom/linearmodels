@@ -16,3 +16,10 @@ Version 7.0
 - Improved compatibility with future NumPy (2.4+) and pandas (3+) changes.
 - Fixed a bug that affected estimation of :class:`~linearmodels.system.model.SUR`
   models with constraints of the form ``R beta = q`` where ``q`` was not 0.
+- Added an optional ``absorb`` keyword to :class:`~linearmodels.iv.model.IV2SLS`
+  and its ``from_formula`` that absorbs one or two high-dimensional categorical
+  effects when estimating the structural parameters of an IV model.  The
+  absorbed effects are partialled out of all model variables using a weighted
+  Frisch-Waugh-Lovell transformation that never materializes the dummy
+  variables, and the rank of the effect space is accounted for in
+  finite-sample adjustments, degrees of freedom and first-stage diagnostics.

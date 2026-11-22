@@ -9,7 +9,7 @@ from linearmodels.compat.statsmodels import Summary
 from collections.abc import Sequence
 import datetime as dt
 from functools import cached_property
-from typing import Any, Union
+from typing import Any, Union, cast
 
 from numpy import (
     array,
@@ -875,6 +875,188 @@ class FirstStageResults(_SummaryStr):
         return smry
 
 
+class AbsorbedFirstStageResults(FirstStageResults):
+    """
+    First stage estimation results and diagnostics for absorbed models
+
+    Parameters
+    ----------
+    model : IV2SLS
+        The model estimated with absorbed effects
+    cov_type : str
+        Covariance estimator used in the main fit
+    cov_config : dict
+        Configuration of the covariance estimator used in the main fit
+
+    Notes
+    -----
+    All quantities are computed in the absorbed space: the endogenous
+    regressors, exogenous regressors and instruments have all been
+    residualized with respect to the absorbed effects, using the same
+    effective sample and observation weights as the main model.  The
+    degrees of freedom used in finite-sample adjustments include the rank
+    of the absorbed effects.
+    """
+
+    def __init__(
+        self,
+        model: linearmodels.iv.model.IV2SLS,
+        cov_type: str,
+        cov_config: dict[str, Any],
+    ) -> None:
+        self._model = model
+        self.dep = model.dependent
+        self.exog = model.exog
+        self.endog = model.endog
+        self.instr = model.instruments
+        self.weights = model.weights
+        self._cov_type = cov_type
+        self._cov_config = cov_config
+
+    def _absorbed_ols(
+        self,
+        dep_orig: DataFrame,
+        dep_absorbed: linearmodels.typing.data.Float64Array,
+        regressors: linearmodels.typing.data.Float64Array,
+        columns: list[str],
+        *,
+        cov_type: str,
+        cov_config: dict[str, Any],
+    ) -> OLSResults:
+        """Fit an OLS regression in the absorbed space"""
+        from linearmodels.iv.model import _OLS
+
+        reg_df = DataFrame(regressors, columns=columns)
+        mod = _OLS(dep_orig, reg_df, weights=self.weights.ndarray)
+        # Replace the dependent variable with its absorbed counterpart
+        # while keeping the original values for the total sum of squares
+        mod._y = dep_absorbed
+        mod._wy = sqrt(self.weights.ndarray) * dep_absorbed
+        # The absorbed effects provide an intercept
+        mod._has_constant = True
+        mod._extra_df = self._model._extra_df
+        return mod.fit(cov_type=cov_type, **cov_config)
+
+    @cached_property
+    def individual(self) -> dict[str, OLSResults]:
+        """
+        Individual model results from first-stage regressions
+
+        Returns
+        -------
+        dict
+            Dictionary containing first stage estimation results. Keys are
+            the variable names of the endogenous regressors.
+        """
+        model = self._model
+        nexog = model.exog.shape[1]
+        first_stage_reg = c_[model._x[:, :nexog], model._z[:, nexog:]]
+        columns = model.exog.cols + model.instruments.cols
+        endog_tilde = model._x[:, nexog:]
+        res: dict[str, OLSResults] = {}
+        for j, col in enumerate(model.endog.cols):
+            dep_orig = model.endog.pandas[[col]]
+            res[str(col)] = self._absorbed_ols(
+                dep_orig,
+                endog_tilde[:, j : j + 1],
+                first_stage_reg,
+                columns,
+                cov_type=self._cov_type,
+                cov_config=self._cov_config,
+            )
+        return res
+
+    @cached_property
+    def diagnostics(self) -> DataFrame:
+        """
+        Post estimation diagnostics of first-stage fit
+
+        Returns
+        -------
+        DataFrame
+            DataFrame where each endogenous variable appears as a row and
+            the columns contain alternative measures.  See
+            :meth:`FirstStageResults.diagnostics` for a description of the
+            columns.  All values are computed in the absorbed space using
+            the same effective sample, weights and covariance
+            configuration as the main model.
+        """
+        from linearmodels.iv.model import _OLS
+
+        model = self._model
+        nexog = model.exog.shape[1]
+        w = sqrt(model.weights.ndarray)
+        x = w * model._x[:, :nexog]
+        z = w * model._z[:, nexog:]
+        nz = z.shape[1]
+        ez = annihilate(z, x)
+        individual_results = self.individual
+        out_df = DataFrame(
+            index=["rsquared", "partial.rsquared", "f.stat", "f.pval", "f.dist"],
+            columns=[],
+        )
+        endog_tilde = model._x[:, nexog:]
+        for j, col in enumerate(model.endog.cols):
+            y = w * endog_tilde[:, j : j + 1]
+            ey = annihilate(y, x)
+            partial = _OLS(ey, ez).fit(cov_type=self._cov_type, **self._cov_config)
+            full = individual_results[str(col)]
+            params = full.params.to_numpy()[-nz:]
+            params = params[:, None]
+            c = asarray(full.cov)[-nz:, -nz:]
+            stat = params.T @ inv(c) @ params
+            stat = float(stat.squeeze())
+            if full.cov_type in ("homoskedastic", "unadjusted"):
+                df_denom = full.df_resid
+                stat /= params.shape[0]
+            else:
+                df_denom = None
+            w_test = WaldTestStatistic(
+                stat, null="", df=params.shape[0], df_denom=df_denom
+            )
+            inner = {
+                "rsquared": full.rsquared,
+                "partial.rsquared": partial.rsquared,
+                "f.stat": w_test.stat,
+                "f.pval": w_test.pval,
+                "f.dist": w_test.dist_name,
+            }
+            out_df[col] = Series(inner)
+        out_df = out_df.T
+
+        r2sls = model.fit(cov_type="unadjusted")
+        y_tilde = cast("linearmodels.typing.data.Float64Array", model._y)
+        x_tilde = cast("linearmodels.typing.data.Float64Array", model._x)
+        rols = self._absorbed_ols(
+            model.dependent.pandas,
+            y_tilde,
+            x_tilde,
+            model.exog.cols + model.endog.cols,
+            cov_type="unadjusted",
+            cov_config={},
+        )
+        shea = (rols.std_errors / r2sls.std_errors) ** 2
+        shea *= (1 - r2sls.rsquared) / (1 - rols.rsquared)
+        out_df["shea.rsquared"] = shea[out_df.index]
+        cols = [
+            "rsquared",
+            "partial.rsquared",
+            "shea.rsquared",
+            "f.stat",
+            "f.pval",
+            "f.dist",
+        ]
+        out_df = out_df[cols]
+        for col in out_df:
+            try:
+                out_df[col] = to_numeric(out_df[col])
+            except ValueError:
+                # If an error is raised, ignore and keep the column
+                pass
+
+        return out_df
+
+
 class _CommonIVResults(OLSResults):
     """
     Results from IV estimation
@@ -1388,6 +1570,124 @@ class IVResults(_CommonIVResults):
         stat = (self._liml_kappa - 1) * df_denom / df
         null = "The model is not overidentified."
         return WaldTestStatistic(stat, null, df, df_denom=df_denom, name=name)
+
+
+_ABSORBED_DIAG_UNAVAILABLE = (
+    "This diagnostic is not available for models that absorb effects. "
+    "Estimate the model with explicit dummy variables to compute it."
+)
+
+
+class IVAbsorbingResults(IVResults):
+    """
+    Results from IV estimation with absorbed effects
+
+    Parameters
+    ----------
+    results : dict[str, any]
+        A dictionary of results from the model estimation.
+    model : IV2SLS
+        The model used to estimate parameters.
+
+    Notes
+    -----
+    Only structural coefficients are reported; the coefficients on the
+    absorbed effects are not estimated.  Overidentification and
+    endogeneity diagnostics that require re-estimation or projections
+    involving the absorbed effects are not available and return
+    :class:`linearmodels.shared.hypotheses.InvalidTestStatistic`.
+    """
+
+    def __init__(
+        self, results: dict[str, Any], model: linearmodels.iv.model.IV2SLS
+    ) -> None:
+        super().__init__(results, model)
+
+    @property
+    def df_absorbed(self) -> int:
+        """Degrees of freedom absorbed by the effects"""
+        return self.df_model - self.params.shape[0]
+
+    @property
+    def first_stage(self) -> AbsorbedFirstStageResults:
+        """
+        First stage regression results
+
+        Returns
+        -------
+        AbsorbedFirstStageResults
+            Object containing results for diagnosing instrument relevance
+            issues, computed in the absorbed space.
+        """
+        return AbsorbedFirstStageResults(self.model, self._cov_type, self._cov_config)
+
+    def _top_right(self) -> list[tuple[str, str]]:
+        top = super()._top_right()
+        top[5] = ("Absorbed Effects:", _str(self.df_absorbed))
+        return top
+
+    def _update_extra_text(self, extra_text: list[str]) -> list[str]:
+        extra_text = super()._update_extra_text(extra_text)
+        absorb = self.model.absorb
+        if absorb is not None:
+            extra_text.append("Absorbed: " + ", ".join(str(c) for c in absorb.columns))
+        return extra_text
+
+    @cached_property
+    def sargan(self) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE, name="Sargan's test of overidentification"
+        )
+
+    @cached_property
+    def basmann(self) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE, name="Basmann's test of overidentification"
+        )
+
+    @cached_property
+    def wooldridge_score(self) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE, name="Wooldridge's score test of exogeneity"
+        )
+
+    @cached_property
+    def wooldridge_regression(self) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE,
+            name="Wooldridge's regression test of exogeneity",
+        )
+
+    @cached_property
+    def wooldridge_overid(self) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE,
+            name="Wooldridge's score test of overidentification",
+        )
+
+    @cached_property
+    def anderson_rubin(self) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE, name="Anderson-Rubin test of overidentification"
+        )
+
+    @cached_property
+    def basmann_f(self) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE, name="Basmann' F  test of overidentification"
+        )
+
+    def durbin(self, variables: str | list[str] | None = None) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE, name="Durbin test of exogeneity"
+        )
+
+    def wu_hausman(
+        self, variables: str | list[str] | None = None
+    ) -> InvalidTestStatistic:
+        return InvalidTestStatistic(
+            _ABSORBED_DIAG_UNAVAILABLE, name="Wu-Hausman test of exogeneity"
+        )
 
 
 class IVGMMResults(_CommonIVResults):

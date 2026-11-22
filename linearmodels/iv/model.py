@@ -19,7 +19,9 @@ from numpy import (
     column_stack,
     dtype,
     eye,
+    finfo,
     float64,
+    isinf,
     isscalar,
     logical_not,
     nan,
@@ -28,11 +30,13 @@ from numpy import (
     ones,
     sqrt,
     squeeze,
+    where,
 )
 from numpy.linalg import eigvalsh, inv, matrix_rank, pinv
 from pandas import DataFrame, Series, concat
 from scipy.optimize import minimize
 
+from linearmodels.iv._absorbing import EffectProjector, validate_absorb_frame
 from linearmodels.iv._utility import IVFormulaParser
 from linearmodels.iv.common import f_statistic, find_constant
 from linearmodels.iv.covariance import (
@@ -49,7 +53,12 @@ from linearmodels.iv.gmm import (
     KernelWeightMatrix,
     OneWayClusteredWeightMatrix,
 )
-from linearmodels.iv.results import IVGMMResults, IVResults, OLSResults
+from linearmodels.iv.results import (
+    IVAbsorbingResults,
+    IVGMMResults,
+    IVResults,
+    OLSResults,
+)
 from linearmodels.shared.exceptions import IndexWarning, missing_warning
 from linearmodels.shared.hypotheses import InvalidTestStatistic, WaldTestStatistic
 from linearmodels.shared.linalg import has_constant, inv_sqrth
@@ -188,6 +197,10 @@ class _IVModelBase:
         self.weights = IVData(weights, var_name="weights", nobs=nobs)
 
         self._drop_locs = self._drop_missing()
+        # Additional degrees of freedom not reflected in the regressor
+        # count (e.g., the rank of absorbed effects).  Zero unless the
+        # model absorbs effects.
+        self._extra_df = 0
         # dependent variable
         w = sqrt(self.weights.ndarray)
         self._y = self.dependent.ndarray
@@ -433,7 +446,9 @@ class _IVModelBase:
     ) -> WaldTestStatistic | InvalidTestStatistic:
         const_loc = find_constant(self._x)
         nobs, nvar = self._x.shape
-        return f_statistic(params, cov, debiased, nobs - nvar, const_loc)
+        return f_statistic(
+            params, cov, debiased, nobs - nvar - self._extra_df, const_loc
+        )
 
     def _post_estimation(
         self,
@@ -454,10 +469,16 @@ class _IVModelBase:
 
         residual_ss = squeeze(weps.T @ weps)
 
+        # The total sum of squares always uses the original dependent
+        # variable.  In models that absorb effects, self._y contains the
+        # absorbed dependent variable while self.dependent preserves the
+        # original values; the two are identical in other models.
         w = self.weights.ndarray
-        e = self._wy
+        root_w = sqrt(w)
+        dep = self.dependent.ndarray
+        e = dep * root_w
         if self.has_constant:
-            e = e - sqrt(self.weights.ndarray) * average(self._y, weights=w)
+            e = e - root_w * average(dep, weights=w)
 
         total_ss = float(squeeze(e.T @ e))
         r2 = 1 - residual_ss / total_ss
@@ -484,6 +505,7 @@ class _IVModelBase:
             "cov_estimator": cov_estimator,
             "fitted": fitted,
             "original_index": self._original_index,
+            "df_model": self._x.shape[1] + self._extra_df,
         }
 
         return out
@@ -695,7 +717,10 @@ class _IVLSModelBase(_IVModelBase):
         cov_config["kappa"] = est_kappa
         cov_config_copy = dict(cov_config.items())
         cov_config_copy.pop("center", None)
-        cov_estimator_inst = cov_estimator(wx, wy, wz, params, **cov_config_copy)
+        cov_config_copy.pop("extra_df", None)
+        cov_estimator_inst = cov_estimator(
+            wx, wy, wz, params, extra_df=self._extra_df, **cov_config_copy
+        )
 
         results = {"kappa": est_kappa, "liml_kappa": liml_kappa}
         pe = self._post_estimation(params, cov_estimator_inst, cov_type)
@@ -704,7 +729,8 @@ class _IVLSModelBase(_IVModelBase):
         if self.endog.shape[1] == 0 and self.instruments.shape[1] == 0:
             return OLSResults(results, self)
         else:
-            return IVResults(results, self)
+            container = getattr(self, "_result_container", IVResults)
+            return container(results, self)
 
 
 class IVLIML(_IVLSModelBase):
@@ -862,6 +888,14 @@ class IV2SLS(_IVLSModelBase):
         Instrumental variables (nobs by ninstr)
     weights : array_like
         Observation weights used in estimation
+    absorb : DataFrame
+        Categorical effects to absorb, provided as a DataFrame with one or
+        two categorical columns and the same number of rows as the other
+        inputs.  Rows are matched to the data by position.  When provided,
+        the effects are partialled out of the dependent variable, the
+        regressors and the instruments, and only the coefficients on the
+        structural regressors are reported.  See the notes section for the
+        restrictions that apply when ``absorb`` is used.
 
     Notes
     -----
@@ -875,6 +909,28 @@ class IV2SLS(_IVLSModelBase):
 
     The 2SLS estimator is a special case of a k-class estimator with
     :math:`\kappa=1`,
+
+    When ``absorb`` is provided, the model is
+
+    .. math::
+
+        y_i = x_i \beta + d_i \gamma + \epsilon_i
+
+    where :math:`d_i` contains the dummy variables generated by the one or
+    two categorical effects.  The effects are removed from all model
+    variables using a weighted Frisch-Waugh-Lovell transformation, and
+    :math:`\beta` is estimated by 2SLS on the transformed data.  The
+    following restrictions apply when absorbing effects:
+
+    * ``endog`` and ``instruments`` must each contain at least one column.
+    * ``exog`` may be None or contain regressors, but must not contain a
+      constant, either explicitly or implicitly, since the effects provide
+      the intercept.
+    * Weights must be strictly positive and finite.
+    * Covariance estimation is limited to "unadjusted" ("homoskedastic"),
+      "robust" ("heteroskedastic") and "clustered" ("one-way").
+    * Out-of-sample prediction is not available since the absorbed effects
+      cannot be recovered for new observations.
 
     .. todo::
 
@@ -893,15 +949,382 @@ class IV2SLS(_IVLSModelBase):
         instruments: IVDataLike | None,
         *,
         weights: IVDataLike | None = None,
+        absorb: DataFrame | None = None,
     ):
         self._method = "IV-2SLS"
-        super().__init__(
-            dependent, exog, endog, instruments, weights=weights, fuller=0, kappa=1
+        self._absorber: EffectProjector | None = None
+        self._absorb: DataFrame | None = None
+        if absorb is None:
+            super().__init__(
+                dependent, exog, endog, instruments, weights=weights, fuller=0, kappa=1
+            )
+        else:
+            self._absorb_init(
+                dependent, exog, endog, instruments, weights=weights, absorb=absorb
+            )
+
+    def _absorb_init(
+        self,
+        dependent: IVDataLike,
+        exog: IVDataLike | None,
+        endog: IVDataLike | None,
+        instruments: IVDataLike | None,
+        *,
+        weights: IVDataLike | None,
+        absorb: DataFrame,
+    ) -> None:
+        """Initialize a model that absorbs high-dimensional effects"""
+        self.dependent = IVData(dependent, var_name="dependent")
+        nobs: int = self.dependent.shape[0]
+        self.exog = IVData(exog, var_name="exog", nobs=nobs)
+        self.endog = IVData(endog, var_name="endog", nobs=nobs)
+        self.instruments = IVData(instruments, var_name="instruments", nobs=nobs)
+        self._original_index = self.dependent.pandas.index
+
+        self._absorb = validate_absorb_frame(absorb, nobs)
+
+        if self.endog.shape[1] == 0:
+            raise ValueError(
+                "endog must contain at least one variable when absorb is used."
+            )
+        if self.instruments.shape[1] == 0:
+            raise ValueError(
+                "instruments must contain at least one variable when absorb is used."
+            )
+
+        if weights is None:
+            weights = ones(self.dependent.shape)
+        weights = IVData(weights).ndarray
+        if npany(weights <= 0):
+            raise ValueError("weights must be strictly positive.")
+        if npany(isinf(weights)):
+            raise ValueError("weights must be finite.")
+        weights = weights / nanmean(weights)
+        self.weights = IVData(weights, var_name="weights", nobs=nobs)
+
+        # Determine the effective sample once; all later stages share it
+        self._drop_locs = self._absorb_drop_missing()
+        self._extra_df = 0
+
+        if self.exog.shape[1] > 0:
+            exog_arr = cast("linearmodels.typing.data.Float64Array", self.exog.ndarray)
+            if has_constant(exog_arr)[0]:
+                raise ValueError(
+                    "exog must not contain a constant, either explicitly or "
+                    "implicitly through a combination of columns, when absorb "
+                    "is used. The absorbed effects already provide an "
+                    "intercept."
+                )
+
+        # Remove categories that no longer appear after dropping rows
+        absorb_df = self._absorb
+        assert absorb_df is not None
+        for col in absorb_df:
+            absorb_df[col] = absorb_df[col].cat.remove_unused_categories()
+        codes = [asarray(absorb_df[col].cat.codes) for col in absorb_df.columns]
+        weights_arr = cast(
+            "linearmodels.typing.data.Float64Array", self.weights.ndarray
+        )
+        self._absorber = EffectProjector(codes, weights_arr.squeeze())
+        self._extra_df = self._absorber.rank
+
+        # Absorb the effects from y, the regressors and the instruments
+        y = self.dependent.ndarray
+        x = c_[self.exog.ndarray, self.endog.ndarray]
+        z = c_[self.exog.ndarray, self.instruments.ndarray]
+        kx = x.shape[1]
+        absorbed = self._absorber.residualize(column_stack([y, x, z]))
+        self._y = absorbed[:, :1]
+        self._x = absorbed[:, 1 : 1 + kx]
+        self._z = absorbed[:, 1 + kx :]
+
+        w = sqrt(self.weights.ndarray)
+        self._wy = self._y * w
+        self._wx = self._x * w
+        self._wz = self._z * w
+
+        # The absorbed effects always provide an intercept; it has no
+        # specific column location, indicated by -1 (the convention used
+        # by has_constant for an implicit constant)
+        self._has_constant = True
+        self._const_loc = -1
+        self._regressor_is_exog = array(
+            [True] * self.exog.shape[1] + [False] * self.endog.shape[1]
+        )
+        self._columns = self.exog.cols + self.endog.cols
+        self._instr_columns = self.exog.cols + self.instruments.cols
+        self._index = self.dependent.rows
+
+        self._absorb_validate_inputs()
+
+        self._kappa = 1
+        self._fuller = 0
+        self._formula = ""
+        self._result_container = IVAbsorbingResults
+
+    def _absorb_drop_missing(self) -> linearmodels.typing.data.BoolArray:
+        """Drop rows with missing values in any input, including absorb"""
+        data = (self.dependent, self.exog, self.endog, self.instruments, self.weights)
+        missing = cast(
+            "linearmodels.typing.data.BoolArray",
+            npany(column_stack([dh.isnull for dh in data]), axis=1),
+        )
+        assert self._absorb is not None
+        missing = missing | self._absorb.isnull().any(axis=1).to_numpy()
+        if npany(missing):
+            if npall(missing):
+                raise ValueError(
+                    "All observations contain missing data. "
+                    "Model cannot be estimated."
+                )
+            self.dependent.drop(missing)
+            self.exog.drop(missing)
+            self.endog.drop(missing)
+            self.instruments.drop(missing)
+            self.weights.drop(missing)
+            self._absorb = self._absorb.loc[~missing]
+
+        missing_warning(missing, stacklevel=4)
+        return missing
+
+    @staticmethod
+    def _check_fully_absorbed(
+        original: linearmodels.typing.data.Float64Array,
+        absorbed: linearmodels.typing.data.Float64Array,
+        names: list[Any],
+        label: str,
+    ) -> None:
+        """Raise if any variable has no variation left after absorption"""
+        if original.shape[1] == 0:
+            return
+        orig_norm = (original**2).sum(axis=0)
+        resid_norm = (absorbed**2).sum(axis=0)
+        eps = float(finfo(float).eps)
+        fully = (resid_norm <= eps * orig_norm) & (orig_norm > 0)
+        if npany(fully):
+            cols = ", ".join(str(names[i]) for i in where(fully)[0])
+            raise ValueError(
+                f"The following variables in {label} have been fully "
+                f"absorbed by the effects and have no remaining variation: "
+                f"{cols}. Remove them from the model or change the absorbed "
+                "effects."
+            )
+
+    def _absorb_validate_inputs(self) -> None:
+        """Validate identification on the original and absorbed arrays"""
+        x, z = self._x, self._z
+        nexog = self.exog.shape[1]
+        if self.instruments.shape[1] < self.endog.shape[1]:
+            raise ValueError(
+                "The number of instruments ({}) must be at least "
+                "as large as the number of endogenous regressors"
+                " ({}).".format(self.instruments.shape[1], self.endog.shape[1])
+            )
+        # Exact degeneracies in the inputs are checked before absorption
+        # since the iterative projection only preserves them up to the
+        # solver tolerance
+        x_raw = c_[self.exog.ndarray, self.endog.ndarray]
+        z_raw = c_[self.exog.ndarray, self.instruments.ndarray]
+        if matrix_rank(x_raw) < x_raw.shape[1]:
+            raise ValueError("regressors [exog endog] do not have full column rank")
+        if matrix_rank(z_raw) < z_raw.shape[1]:
+            raise ValueError(
+                "instruments [exog instruments]  do not have full column rank"
+            )
+        exog_arr = cast("linearmodels.typing.data.Float64Array", self.exog.ndarray)
+        endog_arr = cast("linearmodels.typing.data.Float64Array", self.endog.ndarray)
+        instr_arr = cast(
+            "linearmodels.typing.data.Float64Array", self.instruments.ndarray
+        )
+        self._check_fully_absorbed(exog_arr, x[:, :nexog], self.exog.cols, "exog")
+        self._check_fully_absorbed(endog_arr, x[:, nexog:], self.endog.cols, "endog")
+        self._check_fully_absorbed(
+            instr_arr,
+            z[:, nexog:],
+            self.instruments.cols,
+            "instruments",
+        )
+        if matrix_rank(x) < x.shape[1]:
+            raise ValueError(
+                "regressors [exog endog] do not have full column rank after "
+                "absorbing the effects"
+            )
+        if matrix_rank(z) < z.shape[1]:
+            raise ValueError(
+                "instruments [exog instruments] do not have full column "
+                "rank after absorbing the effects"
+            )
+        if matrix_rank(x.T @ z) < x.shape[1]:
+            raise ValueError(
+                "The structural parameters are not identified: after "
+                "absorbing the effects, the instruments [exog instruments] "
+                "do not sufficiently explain the regressors [exog endog]."
+            )
+
+    def _align_clusters(
+        self, clusters: linearmodels.typing.data.AnyArray
+    ) -> linearmodels.typing.data.AnyArray:
+        """Align cluster labels with the effective estimation sample"""
+        clusters_arr = asarray(clusters)
+        if clusters_arr.ndim == 1:
+            clusters_arr = clusters_arr[:, None]
+        nfull = self._drop_locs.shape[0]
+        nobs = self.dependent.shape[0]
+        if clusters_arr.shape[0] == nfull:
+            clusters_arr = clusters_arr[~self._drop_locs]
+        elif clusters_arr.shape[0] != nobs:
+            raise ValueError(
+                "clusters has the wrong number of rows. Expected "
+                f"{nfull} rows aligned with the original data or {nobs} "
+                "rows aligned with the estimation sample, got "
+                f"{clusters_arr.shape[0]}."
+            )
+        if DataFrame(clusters_arr).isnull().any(axis=1).any():
+            raise ValueError(
+                "clusters contain missing values for observations retained "
+                "in the estimation sample. Cluster labels are required for "
+                "all observations used in estimation."
+            )
+        return clusters_arr
+
+    @property
+    def absorb(self) -> DataFrame | None:
+        """Effects absorbed during estimation, None if not used"""
+        return self._absorb
+
+    def fit(
+        self, *, cov_type: str = "robust", debiased: bool = False, **cov_config: Any
+    ) -> OLSResults | IVResults:
+        """
+        Estimate model parameters
+
+        Parameters
+        ----------
+        cov_type : str
+            Name of covariance estimator to use. Supported covariance
+            estimators are:
+
+            * "unadjusted", "homoskedastic" - Classic homoskedastic inference
+            * "robust", "heteroskedastic" - Heteroskedasticity robust inference
+            * "kernel" - Heteroskedasticity and autocorrelation robust
+              inference.  Not available when ``absorb`` is used.
+            * "clustered" - One-way cluster dependent inference.
+              Heteroskedasticity robust
+
+        debiased : bool
+            Flag indicating whether to debiased the covariance estimator using
+            a degree of freedom adjustment.  When effects are absorbed, the
+            adjustment uses the rank of the full design, including the rank
+            of the absorbed effects.
+        cov_config
+            Additional parameters to pass to covariance estimator. The list
+            of optional parameters differ according to ``cov_type``. See
+            the documentation of the alternative covariance estimators for
+            the complete list of available commands.  When effects are
+            absorbed, ``clusters`` may either be aligned with the original
+            data, in which case the same rows dropped during estimation are
+            also dropped from the cluster labels, or with the estimation
+            sample.  Retained observations must have cluster labels.
+
+        Returns
+        -------
+        IVResults
+            Results container
+
+        Notes
+        -----
+        Additional covariance parameters depend on specific covariance used.
+        The see the docstring of specific covariance estimator for a list of
+        supported options. Defaults are used if no covariance configuration
+        is provided.
+
+        See also
+        --------
+        linearmodels.iv.covariance.HomoskedasticCovariance
+        linearmodels.iv.covariance.HeteroskedasticCovariance
+        linearmodels.iv.covariance.KernelCovariance
+        linearmodels.iv.covariance.ClusteredCovariance
+        """
+        if self._absorber is None:
+            return super().fit(cov_type=cov_type, debiased=debiased, **cov_config)
+        cov_estimator = COVARIANCE_ESTIMATORS[cov_type]
+        if cov_estimator not in (
+            HomoskedasticCovariance,
+            HeteroskedasticCovariance,
+            ClusteredCovariance,
+        ):
+            raise ValueError(
+                f"cov_type '{cov_type}' is not supported when absorb is "
+                "used. Supported covariance estimators are 'unadjusted' "
+                "('homoskedastic'), 'robust' ('heteroskedastic') and "
+                "'clustered' ('one-way')."
+            )
+        if "clusters" in cov_config:
+            cov_config["clusters"] = self._align_clusters(cov_config["clusters"])
+        return super().fit(cov_type=cov_type, debiased=debiased, **cov_config)
+
+    def predict(
+        self,
+        params: linearmodels.typing.data.ArrayLike,
+        *,
+        exog: IVDataLike | None = None,
+        endog: IVDataLike | None = None,
+        data: DataFrame | None = None,
+        eval_env: int = 4,
+    ) -> DataFrame:
+        """
+        Predict values for additional data
+
+        Parameters
+        ----------
+        params : array_like
+            Model parameters (nvar by 1)
+        exog : array_like
+            Exogenous regressors (nobs by nexog)
+        endog : array_like
+            Endogenous regressors (nobs by nendog)
+        data : DataFrame
+            Values to use when making predictions from a model constructed
+            from a formula
+        eval_env : int
+            Depth of use when evaluating formulas.
+
+        Returns
+        -------
+        DataFrame
+            Fitted values from supplied data and parameters
+
+        Notes
+        -----
+        Out-of-sample prediction is not available for models that absorb
+        effects since the absorbed effects cannot be recovered for new
+        observations.  Passing ``exog``, ``endog`` or ``data`` to such a
+        model raises an error rather than returning a prediction that only
+        contains the structural terms.
+        """
+        if self._absorber is not None and (
+            exog is not None or endog is not None or data is not None
+        ):
+            raise ValueError(
+                "Out-of-sample prediction is not supported for models that "
+                "absorb effects. The absorbed effects cannot be recovered "
+                "for new observations, and the structural terms alone are "
+                "not a complete prediction. In-sample fitted values and "
+                "residuals are available from the results object."
+            )
+        # This override adds a stack frame, so the evaluation environment
+        # depth is increased by one to preserve the original behavior
+        return super().predict(
+            params, exog=exog, endog=endog, data=data, eval_env=eval_env + 1
         )
 
     @staticmethod
     def from_formula(
-        formula: str, data: DataFrame, *, weights: IVDataLike | None = None
+        formula: str,
+        data: DataFrame,
+        *,
+        weights: IVDataLike | None = None,
+        absorb: DataFrame | None = None,
     ) -> IV2SLS:
         """
         Parameters
@@ -913,6 +1336,10 @@ class IV2SLS(_IVLSModelBase):
             DataFrame containing the variables used in the formula
         weights : array_like
             Observation weights used in estimation
+        absorb : DataFrame
+            Categorical effects to absorb, provided as a DataFrame with one
+            or two categorical columns and the same number of rows as
+            ``data``.  Rows are matched to the data by position.
 
         Returns
         -------
@@ -930,6 +1357,8 @@ class IV2SLS(_IVLSModelBase):
         valid formulas.
 
         A constant must be explicitly included using "1 +" if required.
+        When ``absorb`` is used, the formula must not include a constant
+        since the absorbed effects provide the intercept.
 
         Examples
         --------
@@ -942,7 +1371,7 @@ class IV2SLS(_IVLSModelBase):
         """
         parser = IVFormulaParser(formula, data)
         dep, exog, endog, instr = parser.data
-        mod = IV2SLS(dep, exog, endog, instr, weights=weights)
+        mod = IV2SLS(dep, exog, endog, instr, weights=weights, absorb=absorb)
         mod.formula = formula
         return mod
 

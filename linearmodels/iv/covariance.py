@@ -232,6 +232,12 @@ class HomoskedasticCovariance:
         Flag indicating whether to use a small-sample adjustment
     kappa : float
         Value of kappa in k-class estimator
+    extra_df : int
+        Additional degrees of freedom consumed by the model that are not
+        reflected in the number of columns of ``x``, e.g., the rank of a
+        set of absorbed effects.  Only used when ``debiased`` is True, in
+        which case the small-sample adjustment uses ``nobs - nvar -
+        extra_df`` as the residual degrees of freedom.
 
     Notes
     -----
@@ -247,7 +253,8 @@ class HomoskedasticCovariance:
 
       s^2 = n^{-1} \sum_{i=1}^n \hat{\epsilon}_i^2
 
-    If ``debiased`` is true, then :math:`s^2` is scaled by n / (n-k).
+    If ``debiased`` is true, then :math:`s^2` is scaled by n / (n-k) where
+    k includes any ``extra_df``.
 
     .. math::
 
@@ -265,6 +272,7 @@ class HomoskedasticCovariance:
         params: linearmodels.typing.data.Float64Array,
         debiased: bool = False,
         kappa: linearmodels.typing.Numeric = 1,
+        extra_df: int = 0,
     ):
         if not (x.shape[0] == y.shape[0] == z.shape[0]):
             raise ValueError("x, y and z must have the same number of rows")
@@ -278,9 +286,12 @@ class HomoskedasticCovariance:
         self._debiased = debiased
         self.eps = y - x @ params
         self._kappa = kappa
+        self._extra_df = int(extra_df)
         self._pinvz = pinv(z)
         nobs, nvar = x.shape
-        self._scale: float = nobs / (nobs - nvar) if self._debiased else 1.0
+        self._scale: float = (
+            nobs / (nobs - nvar - self._extra_df) if self._debiased else 1.0
+        )
         self._name = "Unadjusted Covariance (Homoskedastic)"
 
     def __str__(self) -> str:
@@ -366,6 +377,10 @@ class HeteroskedasticCovariance(HomoskedasticCovariance):
         Flag indicating whether to use a small-sample adjustment
     kappa : float
         Value of kappa in k-class estimator
+    extra_df : int
+        Additional degrees of freedom consumed by the model that are not
+        reflected in the number of columns of ``x``, e.g., the rank of a
+        set of absorbed effects.  Only used when ``debiased`` is True.
 
     Notes
     -----
@@ -383,7 +398,7 @@ class HeteroskedasticCovariance(HomoskedasticCovariance):
 
     where :math:`\hat{\gamma}=(Z'Z)^{-1}(Z'X)` and
     :math:`\hat{x}_i = z_i\hat{\gamma}`. If ``debiased`` is true, then
-    :math:`S` is scaled by n / (n-k).
+    :math:`S` is scaled by n / (n-k) where k includes any ``extra_df``.
 
     .. math::
 
@@ -401,8 +416,9 @@ class HeteroskedasticCovariance(HomoskedasticCovariance):
         params: linearmodels.typing.data.Float64Array,
         debiased: bool = False,
         kappa: linearmodels.typing.Numeric = 1,
+        extra_df: int = 0,
     ):
-        super().__init__(x, y, z, params, debiased, kappa)
+        super().__init__(x, y, z, params, debiased, kappa, extra_df)
         self._name = "Robust Covariance (Heteroskedastic)"
 
     @property
@@ -445,6 +461,10 @@ class KernelCovariance(HomoskedasticCovariance):
         Flag indicating whether to use a small-sample adjustment
     kappa : float
         Value of kappa in k-class estimator
+    extra_df : int
+        Additional degrees of freedom consumed by the model that are not
+        reflected in the number of columns of ``x``, e.g., the rank of a
+        set of absorbed effects.  Only used when ``debiased`` is True.
 
     Notes
     -----
@@ -468,7 +488,7 @@ class KernelCovariance(HomoskedasticCovariance):
     where :math:`\hat{\gamma}=(Z'Z)^{-1}(Z'X)`,
     :math:`\hat{x}_i = z_i\hat{\gamma}` and :math:`K(i,bw)` is a weight that
     depends on the kernel. If ``debiased`` is true, then :math:`S` is scaled
-    by n / (n-k).
+    by n / (n-k) where k includes any ``extra_df``.
 
     .. math::
 
@@ -494,8 +514,9 @@ class KernelCovariance(HomoskedasticCovariance):
         bandwidth: linearmodels.typing.OptionalNumeric = None,
         debiased: bool = False,
         kappa: linearmodels.typing.Numeric = 1,
+        extra_df: int = 0,
     ):
-        super().__init__(x, y, z, params, debiased, kappa)
+        super().__init__(x, y, z, params, debiased, kappa, extra_df)
         self._kernels = KERNEL_LOOKUP
         self._kernel = kernel
         self._bandwidth = bandwidth
@@ -572,6 +593,10 @@ class ClusteredCovariance(HomoskedasticCovariance):
         Either nobs by ncluster where ncluster is 1 or 2.
     kappa : float
         Value of kappa in k-class estimator
+    extra_df : int
+        Additional degrees of freedom consumed by the model that are not
+        reflected in the number of columns of ``x``, e.g., the rank of a
+        set of absorbed effects.  Only used when ``debiased`` is True.
 
 
     Notes
@@ -612,8 +637,9 @@ class ClusteredCovariance(HomoskedasticCovariance):
         clusters: linearmodels.typing.data.AnyArray | None = None,
         debiased: bool = False,
         kappa: linearmodels.typing.Numeric = 1,
+        extra_df: int = 0,
     ):
-        super().__init__(x, y, z, params, debiased, kappa)
+        super().__init__(x, y, z, params, debiased, kappa, extra_df)
 
         nobs = x.shape[0]
         clusters = arange(nobs) if clusters is None else clusters
