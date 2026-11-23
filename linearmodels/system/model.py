@@ -94,6 +94,180 @@ GMM_COV_EST = {
 }
 
 
+def _column_scales(
+    x: linearmodels.typing.data.Float64Array,
+) -> linearmodels.typing.data.Float64Array:
+    r"""
+    Compute signed per-column scaling factors used to build internal units
+
+    Parameters
+    ----------
+    x : ndarray
+        Two dimensional array
+
+    Returns
+    -------
+    ndarray
+        Non-zero column scaling factors (norm times the sign of the
+        largest-magnitude entry).  Zero columns are left at a scale of 1 so
+        that they are still detected as rank deficient.
+
+    Notes
+    -----
+    Dividing each column by this scale is homogeneous of degree one, and the
+    orientation is pinned to the largest-magnitude entry.  As a result a
+    change of units (including a negative proportional change) leaves the
+    internal column *exactly* unchanged, not merely unchanged up to sign.
+    This makes the numerical rank checks, the estimation, the convergence
+    criterion and every derived quantity invariant to the units chosen for
+    structural variables and instruments.
+    """
+    n, k = x.shape
+    norms = np.sqrt(np.sum(x * x, axis=0))
+    scales = np.where(norms > 0, norms, 1.0)
+    if n > 0 and k > 0:
+        idx = np.argmax(np.abs(x), axis=0)
+        signs = np.sign(x[idx, np.arange(k)])
+        signs = np.where(signs == 0, 1.0, signs)
+        scales = scales * signs
+    return cast("linearmodels.typing.data.Float64Array", scales)
+
+
+def _column_norms(
+    x: linearmodels.typing.data.Float64Array,
+) -> linearmodels.typing.data.Float64Array:
+    r"""Positive per-column Euclidean norms used for rank checks"""
+    norms = np.sqrt(np.sum(x * x, axis=0))
+    return cast(
+        "linearmodels.typing.data.Float64Array",
+        np.where(norms > 0, norms, 1.0),
+    )
+
+
+def _internal_constraints(
+    constraints: LinearConstraint | None,
+    x_scale: Sequence[linearmodels.typing.data.Float64Array],
+) -> LinearConstraint | None:
+    r"""
+    Re-express user constraints on the internally scaled parameters
+
+    Parameters
+    ----------
+    constraints : {LinearConstraint, None}
+        Constraints expressed in the user's parameter units
+    x_scale : list[ndarray]
+        Per-equation column norms used to build the internal parameters
+
+    Returns
+    -------
+    {LinearConstraint, None}
+        Equivalent constraints acting on the internal parameters
+
+    Notes
+    -----
+    The internal parameters satisfy ``beta_i = diag(x_scale) beta`` (the
+    ``x_scale`` values carry the sign of the largest-magnitude entry of each
+    column).  A user constraint ``r beta = q`` is therefore equivalent to
+    ``(r diag(1 / x_scale)) beta_i = q``.  Because the scaling factors are
+    non-zero, the rank and feasibility of the constraint set are unchanged.
+    """
+    if constraints is None:
+        return None
+    r = np.asarray(constraints.r, dtype=np.float64)
+    scale = np.concatenate([np.asarray(s) for s in x_scale])
+    r_internal = r / scale[None, :]
+    q = np.asarray(constraints.q, dtype=np.float64)
+    # Row-normalize so that the numerical rank/feasibility checks performed by
+    # LinearConstraint are not confused by loadings that become very small (or
+    # very large) purely because of the change of units.  Positive row scaling
+    # leaves the constraint set, its rank and its feasibility unchanged.
+    row_scale = np.max(np.abs(r_internal), axis=1)
+    row_scale = np.where(row_scale > 0, row_scale, 1.0)
+    r_internal = r_internal / row_scale[:, None]
+    q_internal = q / row_scale
+    return LinearConstraint(
+        r_internal,
+        q_internal,
+        num_params=r_internal.shape[1],
+        require_pandas=False,
+        # The constraints were already validated by ``add_constraints`` in the
+        # user's coordinates.  This is an exact, invertible rescaling of the
+        # parameter units, so re-running the numerical rank/feasibility checks
+        # on the rescale could report a false negative when the loadings differ
+        # across equations by many orders of magnitude.
+        validate=False,
+    )
+
+
+def _to_internal_weight(
+    w: linearmodels.typing.data.Float64Array,
+    z_scale: Sequence[linearmodels.typing.data.Float64Array],
+) -> linearmodels.typing.data.Float64Array:
+    r"""
+    Transform a user-coordinate moment covariance to internal coordinates
+
+    Parameters
+    ----------
+    w : ndarray
+        Moment condition covariance in the user's instrument units
+    z_scale : list[ndarray]
+        Per-equation instrument column norms
+
+    Returns
+    -------
+    ndarray
+        Moment covariance in the internal units
+
+    Notes
+    -----
+    The internal moments are ``z_i eps = diag(1 / z_scale) z eps`` so that
+    ``w_i = diag(1 / z_scale) w diag(1 / z_scale)``.  This is a congruence
+    transform and preserves positive definiteness and rank.
+    """
+    w = np.asarray(w, dtype=np.float64)
+    scale = np.concatenate([np.asarray(s) for s in z_scale])
+    if w.ndim != 2 or w.shape != (scale.shape[0], scale.shape[0]):
+        raise ValueError(
+            "initial_weight must be a "
+            f"{scale.shape[0]} by {scale.shape[0]} array"
+        )
+    return cast(
+        "linearmodels.typing.data.Float64Array",
+        w / (scale[:, None] * scale[None, :]),
+    )
+
+
+def _from_internal_weight(
+    w: linearmodels.typing.data.Float64Array,
+    z_scale: Sequence[linearmodels.typing.data.Float64Array],
+) -> linearmodels.typing.data.Float64Array:
+    r"""Transform an internal moment covariance back to user coordinates"""
+    scale = np.concatenate([np.asarray(s) for s in z_scale])
+    return cast(
+        "linearmodels.typing.data.Float64Array",
+        w * (scale[:, None] * scale[None, :]),
+    )
+
+
+def _from_internal_params(
+    beta: linearmodels.typing.data.Float64Array,
+    x_scale: Sequence[linearmodels.typing.data.Float64Array],
+) -> linearmodels.typing.data.Float64Array:
+    r"""Transform internal parameters back to the user's units"""
+    scale = np.concatenate([np.asarray(s) for s in x_scale])
+    return cast("linearmodels.typing.data.Float64Array", beta / scale[:, None])
+
+
+def _from_internal_cov(
+    cov: linearmodels.typing.data.Float64Array,
+    x_scale: Sequence[linearmodels.typing.data.Float64Array],
+) -> linearmodels.typing.data.Float64Array:
+    r"""Transform an internal parameter covariance back to user units"""
+    scale = np.concatenate([np.asarray(s) for s in x_scale])
+    out = cov / (scale[:, None] * scale[None, :])
+    return cast("linearmodels.typing.data.Float64Array", (out + out.T) / 2)
+
+
 def _missing_weights(
     weights: Mapping[str, linearmodels.typing.data.ArrayLike | None],
 ) -> None:
@@ -531,7 +705,13 @@ class _SystemModelBase:
                     "Fewer observations than variables in "
                     "equation `{eq}`".format(eq=label)
                 )
-            if matrix_rank(x) < x.shape[1]:
+            # Rank checks are performed on the internally normalized columns so
+            # that a change of units (a diagonal re-scaling, possibly with
+            # negative proportions) cannot make a full-rank array appear
+            # rank deficient.  A genuinely duplicated column, or a column that
+            # is a linear combination of the others, is still detected.
+            x_scale = _column_norms(x)
+            if matrix_rank(x / x_scale) < x.shape[1]:
                 raise ValueError(
                     "Equation `{eq}` regressor array is not full rank".format(eq=label)
                 )
@@ -545,7 +725,8 @@ class _SystemModelBase:
                     "Fewer observations than instruments in "
                     "equation `{eq}`".format(eq=label)
                 )
-            if matrix_rank(z) < z.shape[1]:
+            z_scale = _column_norms(z)
+            if matrix_rank(z / z_scale) < z.shape[1]:
                 raise ValueError(
                     "Equation {eq} instrument array is full rank".format(eq=label)
                 )
@@ -1945,7 +2126,11 @@ class IVSystemGMM(_SystemModelBase):
         initial_weight : ndarray
             Initial weighting matrix to use in the first step. If not
             specified, uses the average outer-product of the set containing
-            the exogenous variables and instruments.
+            the exogenous variables and instruments.  This matrix is the
+            covariance of the moment conditions expressed in the original
+            units of the instruments.  If the instruments are re-scaled, the
+            initial weight matrix should be re-scaled using the corresponding
+            diagonal transformation to produce an equivalent estimate.
         cov_type : str
             Name of covariance estimator. Valid options are
 
@@ -1961,6 +2146,23 @@ class IVSystemGMM(_SystemModelBase):
         -------
         GMMSystemResults
             Estimation results
+
+        Notes
+        -----
+        Estimation is carried out in an internal, unit-free coordinate
+        system.  Each column of every equation's structural regressors and
+        instruments is divided by a signed column scale (its Euclidean norm,
+        with orientation fixed by its largest-magnitude entry) before the
+        block-GMM problem is solved.  This is an exact diagonal
+        re-parameterization of the user's problem: if ``x -> x D_x`` and
+        ``z -> z D_z`` for diagonal, invertible (and possibly sign-changing)
+        ``D_x`` and ``D_z``, the internal arrays are unchanged.  Parameters,
+        covariance, standard errors and the weighting matrix are transformed
+        back to the original units before they are returned.  Consequently a
+        change of measurement units cannot alter a well-identified model, and
+        the convergence criterion (a covariance-normalized change in the
+        internal parameters, with ``tol`` unchanged) is invariant to the
+        units used.
         """
         if cov_type not in COV_TYPES:
             raise ValueError(f"Unknown cov_type: {cov_type}")
@@ -1969,90 +2171,127 @@ class IVSystemGMM(_SystemModelBase):
         k = len(wx)
         nobs = wx[0].shape[0]
         k_total = sum(a.shape[1] for a in wz)
+
+        # Internal, unit-free coordinates.  Scaling each column by its norm is
+        # a diagonal change of variables in both the parameters and the
+        # moment conditions; every quantity below is invariant to the user's
+        # choice of units.
+        x_scale = [_column_scales(a) for a in wx]
+        z_scale = [_column_scales(a) for a in wz]
+        wx_i = [wx[i] / x_scale[i] for i in range(k)]
+        wz_i = [wz[i] / z_scale[i] for i in range(k)]
+        constraints_i = _internal_constraints(self.constraints, x_scale)
+
         if initial_weight is None:
-            w = blocked_inner_prod(wz, np.eye(k_total)) / nobs
+            w = blocked_inner_prod(wz_i, np.eye(k_total)) / nobs
         else:
-            w = initial_weight
+            w = _to_internal_weight(initial_weight, z_scale)
         assert w is not None
-        beta_last = beta = self._blocked_gmm(
-            wx,
+        beta_i = self._blocked_gmm(
+            wx_i,
             wy,
-            wz,
+            wz_i,
             w=cast("linearmodels.typing.data.Float64Array", w),
-            constraints=self.constraints,
+            constraints=constraints_i,
         )
+        beta_last = beta_i
         _eps = []
         loc = 0
         for i in range(k):
-            nb = wx[i].shape[1]
-            b = beta[loc : loc + nb]
-            _eps.append(wy[i] - wx[i] @ b)
+            nb = wx_i[i].shape[1]
+            b = beta_i[loc : loc + nb]
+            _eps.append(wy[i] - wx_i[i] @ b)
             loc += nb
         eps = np.hstack(_eps)
-        sigma = self._weight_est.sigma(eps, wx) if self._sigma is None else self._sigma
+        sigma = (
+            self._weight_est.sigma(eps, wx_i)
+            if self._sigma is None
+            else self._sigma
+        )
         vinv = None
         iters = 1
         norm = 10 * tol + 1
         while iters < iter_limit and norm > tol:
             sigma = (
-                self._weight_est.sigma(eps, wx) if self._sigma is None else self._sigma
+                self._weight_est.sigma(eps, wx_i)
+                if self._sigma is None
+                else self._sigma
             )
-            w = self._weight_est.weight_matrix(wx, wz, eps, sigma=sigma)
-            beta = self._blocked_gmm(
-                wx,
+            w = self._weight_est.weight_matrix(wx_i, wz_i, eps, sigma=sigma)
+            beta_i = self._blocked_gmm(
+                wx_i,
                 wy,
-                wz,
+                wz_i,
                 w=cast("linearmodels.typing.data.Float64Array", w),
-                constraints=self.constraints,
+                constraints=constraints_i,
             )
-            delta = beta_last - beta
+            delta = beta_last - beta_i
             if vinv is None:
                 winv = np.linalg.inv(w)
-                xpz = blocked_cross_prod(wx, wz, np.eye(k))
+                xpz = blocked_cross_prod(wx_i, wz_i, np.eye(k))
                 xpz = cast("linearmodels.typing.data.Float64Array", xpz / nobs)
                 v = (xpz @ winv @ xpz.T) / nobs
                 vinv = inv(v)
+            # The convergence criterion is the covariance-normalized change in
+            # the parameters, measured in the unit-free internal coordinates.
+            # Because those coordinates do not depend on the user's units, a
+            # change of units cannot make the loop stop earlier or later.
             norm = float(np.squeeze(delta.T @ vinv @ delta))
-            beta_last = beta
+            beta_last = beta_i
 
             _eps = []
             loc = 0
             for i in range(k):
-                nb = wx[i].shape[1]
-                b = beta[loc : loc + nb]
-                _eps.append(wy[i] - wx[i] @ b)
+                nb = wx_i[i].shape[1]
+                b = beta_i[loc : loc + nb]
+                _eps.append(wy[i] - wx_i[i] @ b)
                 loc += nb
             eps = np.hstack(_eps)
             iters += 1
 
-        cov_type = COV_TYPES[cov_type]
-        cov_est = GMM_COV_EST[cov_type]
-        cov = cov_est(
-            wx, wz, eps, w, sigma=sigma, constraints=self._constraints, **cov_config
+        # Convert estimates back to the original units
+        beta = _from_internal_params(beta_i, x_scale)
+        w_user = _from_internal_weight(
+            cast("linearmodels.typing.data.Float64Array", w), z_scale
         )
 
-        weps = eps
+        cov_type = COV_TYPES[cov_type]
+        cov_est = GMM_COV_EST[cov_type]
+        cov_instance = cov_est(
+            wx_i,
+            wz_i,
+            eps,
+            cast("linearmodels.typing.data.Float64Array", w),
+            sigma=sigma,
+            constraints=constraints_i,
+            **cov_config,
+        )
+        cov = _from_internal_cov(cov_instance.cov, x_scale)
+
+        x, y = self._x, self._y
+        _weps = []
         _eps = []
         loc = 0
-        x, y = self._x, self._y
         for i in range(k):
             nb = x[i].shape[1]
             b = beta[loc : loc + nb]
+            _weps.append(wy[i] - wx[i] @ b)
             _eps.append(y[i] - x[i] @ b)
             loc += nb
+        weps = np.hstack(_weps)
         eps = np.hstack(_eps)
         iters += 1
         return self._finalize_results(
             beta,
-            cov.cov,
+            cov,
             weps,
             eps,
-            cast("np.ndarray", w),
+            w_user,
             sigma,
             iters - 1,
             cov_type,
             cov_config,
-            cov,
+            cov_instance,
         )
 
     @staticmethod
@@ -2068,6 +2307,19 @@ class IVSystemGMM(_SystemModelBase):
         xpz = blocked_cross_prod(x, z, np.eye(k))
         wi = np.linalg.inv(w)
         xpz_wi_zpx = xpz @ wi @ xpz.T
+        # Check identification of the system that is actually solved.  When
+        # constraints are present, the constrained cross product is the
+        # relevant one.  The check is performed in the internal units so that
+        # unit changes cannot trigger a spurious failure, while genuine
+        # duplication or under-identification still raises a clear error.
+        target = xpz_wi_zpx
+        if constraints is not None:
+            target = constraints.t.T @ target @ constraints.t
+        if matrix_rank(target) < target.shape[0]:
+            raise ValueError(
+                "The system GMM parameters are not identified: the instruments "
+                "do not span the structural regressors."
+            )
         zpy_arrs = []
         zpy_arrs = [(z[i].T @ y[i]) for i in range(k)]
         zpy = np.vstack(zpy_arrs)
@@ -2255,18 +2507,25 @@ class IVSystemGMM(_SystemModelBase):
         """
         y, x, z = self._wy, self._wx, self._wz
         k = len(x)
+        x_scale = [_column_scales(a) for a in x]
+        z_scale = [_column_scales(a) for a in z]
+        x_i = [x[i] / x_scale[i] for i in range(k)]
+        z_i = [z[i] / z_scale[i] for i in range(k)]
+        scale = np.concatenate(x_scale)
+        params_i = params * scale[:, None]
+        w_i = _to_internal_weight(weight_mat, z_scale)
         ze_lst = []
         idx = 0
         for i in range(k):
-            kx = x[i].shape[1]
-            beta = params[idx : idx + kx]
-            eps = y[i] - x[i] @ beta
-            ze_lst.append(z[i] * eps)
+            kx = x_i[i].shape[1]
+            beta = params_i[idx : idx + kx]
+            eps = y[i] - x_i[i] @ beta
+            ze_lst.append(z_i[i] * eps)
             idx += kx
         ze = np.concatenate(ze_lst, 1)
         g_bar = ze.mean(0)
         nobs = x[0].shape[0]
-        stat = float(nobs * g_bar.T @ np.linalg.inv(weight_mat) @ g_bar.T)
+        stat = float(nobs * g_bar.T @ np.linalg.inv(w_i) @ g_bar.T)
         null = "Expected moment conditions are equal to 0"
         ninstr = sum(a.shape[1] for a in z)
         nvar = sum(a.shape[1] for a in x)

@@ -241,6 +241,7 @@ class LinearConstraint:
         q: pd.Series | ndarray | None = None,
         num_params: int | None = None,
         require_pandas: bool = True,
+        validate: bool = True,
     ) -> None:
         if not isinstance(r, (pd.DataFrame, np.ndarray)):
             raise TypeError("r must be an array or DataFrame")
@@ -270,7 +271,8 @@ class LinearConstraint:
         self._l = np.empty((0, 0))
         self._a = np.empty((0, 0))
         self._num_params = num_params
-        self._verify_constraints()
+        if validate:
+            self._verify_constraints()
 
     def __repr__(self) -> str:
         return self.__str__() + "\nid: " + str(hex(id(self)))
