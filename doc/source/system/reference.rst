@@ -36,6 +36,7 @@ Estimation Results
    :toctree: system/
 
    SystemResults
+   ObservedSURResults
    GMMSystemResults
 
 .. _system_models-module-reference-covariance:
@@ -58,6 +59,20 @@ SUR and 3SLS
    HeteroskedasticCovariance
    KernelCovariance
    ClusteredCovariance
+
+Observed-data SUR (``missing="observed"``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. module:: linearmodels.system.observed_covariance
+   :synopsis: Covariance estimators for observed-data SUR likelihoods
+
+.. currentmodule:: linearmodels.system.observed_covariance
+
+.. autosummary::
+   :toctree: system/
+
+   ObservedHomoskedasticCovariance
+   ObservedHeteroskedasticCovariance
 
 Generalized Method of Moments (GMM)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

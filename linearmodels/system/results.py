@@ -7,7 +7,7 @@ from functools import cached_property
 from typing import Any, Union
 
 import numpy as np
-from pandas import DataFrame, Series, concat
+from pandas import DataFrame, Index, Series, concat
 from scipy import stats
 from statsmodels.iolib.summary import SimpleTable, fmt_2cols
 
@@ -18,7 +18,19 @@ from linearmodels.shared.io import _str, format_wide, param_table, pval_format
 from linearmodels.shared.utility import AttrDict
 import linearmodels.typing.data
 
-__all__ = ["Equation", "GMMSystemResults", "SystemEquationResult", "SystemResults"]
+__all__ = [
+    "Equation",
+    "GMMSystemResults",
+    "ObservedSURResults",
+    "SystemEquationResult",
+    "SystemResults",
+]
+
+OBSERVED_UNAVAILABLE = (
+    "Test statistics that require a complete rectangular residual matrix "
+    "are not defined for models fit with missing='observed' because "
+    "dependent cells can be unobserved."
+)
 
 Equation = Union[
     tuple[linearmodels.typing.data.ArrayLike, linearmodels.typing.data.ArrayLike],
@@ -84,6 +96,11 @@ class _CommonResults(_SummaryStr):
     def params(self) -> Series:
         """Estimated parameters"""
         return Series(self._params.squeeze(), index=self._param_names, name="params")
+
+    @property
+    def param_names(self) -> list[str]:
+        """Names of the estimated parameters in order."""
+        return list(self._param_names)
 
     @property
     def std_errors(self) -> Series:
@@ -628,6 +645,145 @@ class SystemResults(_CommonResults):
             k * (k - 1) // 2,
             name=name,
         )
+
+
+class ObservedSURResults(SystemResults):
+    """
+    Results from a SUR estimated on partially observed dependent data.
+
+    The residuals and fitted values keep the original row layout: a cell
+    whose dependent was not observed holds a NaN residual, while fitted
+    values (the conditional mean :math:`x\\beta`) are reported on every row
+    for every equation. Per-equation ``nobs`` counts the rows actually
+    observed for that equation, and the system ``nobs`` is their sum.
+    """
+
+    def __init__(self, results: AttrDict) -> None:
+        super().__init__(results)
+        self._loglik = results.loglik
+        self._converged = bool(results.converged)
+        self._termination = str(results.termination)
+        self._score_norm = float(results.score_norm)
+        self._fit_tol = float(results.iter_limit_tol)
+        self._known_sigma = bool(results.known_sigma)
+        self._observed_mask = np.asarray(results.observed_mask, dtype=bool)
+        self._empty_rows = np.asarray(results.empty_rows, dtype=np.int64)
+        self._nobs_per_eq = np.asarray(results.nobs_per_eq, dtype=np.int64)
+        self._full_information = results.full_information
+        self._row_scores = results.row_scores
+        self._score_rows = np.asarray(results.score_rows, dtype=np.int64)
+
+    @property
+    def loglik(self) -> float:
+        """Observed-data joint log-likelihood at the solution."""
+        return self._loglik
+
+    @property
+    def converged(self) -> bool:
+        """Whether the likelihood iteration met its stopping criterion."""
+        return self._converged
+
+    @property
+    def termination(self) -> str:
+        """Human-readable optimizer termination message."""
+        return self._termination
+
+    @property
+    def score_norm(self) -> float:
+        """RMS norm of the analytic likelihood score at the solution."""
+        return self._score_norm
+
+    @property
+    def tol(self) -> float:
+        """Convergence tolerance used by the likelihood iteration."""
+        return self._fit_tol
+
+    @property
+    def known_sigma(self) -> bool:
+        """Whether sigma was supplied as a known covariance matrix."""
+        return self._known_sigma
+
+    @property
+    def observed_mask(self) -> DataFrame:
+        """Boolean frame marking the dependent cells that were observed."""
+        return DataFrame(
+            self._observed_mask,
+            index=self._original_index,
+            columns=self.equation_labels,
+        )
+
+    @property
+    def empty_rows(self) -> DataFrame:
+        """Rows retained in the layout but without any observed dependent."""
+        if self._empty_rows.shape[0] == 0:
+            return DataFrame(index=Index([], dtype=np.int64))
+        return DataFrame(
+            np.asarray(self._index)[self._empty_rows],
+            columns=["row"],
+            index=Index(self._empty_rows, name="position"),
+        )
+
+    @property
+    def nobs_per_equation(self) -> Series:
+        """Number of observed dependent cells in each equation."""
+        return Series(self._nobs_per_eq, index=self.equation_labels, name="nobs")
+
+    @property
+    def information(self) -> DataFrame:
+        """Observed information of the full likelihood parameter vector."""
+        names = list(self._param_names)
+        if not self._known_sigma:
+            k = len(self.equation_labels)
+            sigma_names = [
+                f"sigma[{self.equation_labels[i]},{self.equation_labels[j]}]"
+                for i in range(k)
+                for j in range(i, k)
+            ]
+            names = names + sigma_names
+        return DataFrame(self._full_information, index=names, columns=names)
+
+    @property
+    def equation_nobs(self) -> Series:
+        """Deprecated alias of :attr:`nobs_per_equation`."""
+        return self.nobs_per_equation
+
+    def breusch_pagan(self) -> InvalidTestStatistic:  # type: ignore[override]
+        return InvalidTestStatistic(OBSERVED_UNAVAILABLE, name="Breusch-Pagan LM Test")
+
+    def likelihood_ratio(self) -> InvalidTestStatistic:  # type: ignore[override]
+        return InvalidTestStatistic(
+            OBSERVED_UNAVAILABLE,
+            name="Likelihood Ratio Test for Diagonal Covariance",
+        )
+
+    @property
+    def summary(self) -> Summary:
+        smry = super().summary
+        smry.add_extra_txt(
+            [
+                "Observed-data maximum likelihood:",
+                f"Log-likelihood: {self._loglik:.6g}",
+                (
+                    f"Converged: {self._converged} (tol={self._fit_tol:g}, "
+                    f"score norm={self._score_norm:.3g})"
+                ),
+                f"Termination: {self._termination}",
+                (
+                    "Per-equation observations: "
+                    + ", ".join(
+                        f"{lab}={int(n)}"
+                        for lab, n in zip(
+                            self.equation_labels, self._nobs_per_eq, strict=False
+                        )
+                    )
+                ),
+                (
+                    "Rows without any observed dependent: "
+                    f"{self._empty_rows.shape[0]}"
+                ),
+            ]
+        )
+        return smry
 
 
 class SystemEquationResult(_CommonResults):

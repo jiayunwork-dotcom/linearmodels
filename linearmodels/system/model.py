@@ -48,12 +48,25 @@ from linearmodels.system.covariance import (
     HomoskedasticCovariance,
     KernelCovariance,
 )
+from linearmodels.system.ml import (
+    ObservedSURError,
+    check_known_sigma,
+    fit_observed_sur,
+)
+from linearmodels.system.observed_covariance import (
+    ObservedHeteroskedasticCovariance,
+    ObservedHomoskedasticCovariance,
+)
 from linearmodels.system.gmm import (
     HeteroskedasticWeightMatrix,
     HomoskedasticWeightMatrix,
     KernelWeightMatrix,
 )
-from linearmodels.system.results import GMMSystemResults, SystemResults
+from linearmodels.system.results import (
+    GMMSystemResults,
+    ObservedSURResults,
+    SystemResults,
+)
 import linearmodels.typing.data
 
 __all__ = ["IV3SLS", "SUR", "IVSystemGMM", "LinearConstraint"]
@@ -92,6 +105,13 @@ GMM_COV_EST = {
     "robust": GMMHeteroskedasticCovariance,
     "kernel": GMMKernelCovariance,
 }
+
+OBSERVED_COV_EST = {
+    "unadjusted": ObservedHomoskedasticCovariance,
+    "robust": ObservedHeteroskedasticCovariance,
+}
+
+OBSERVED_MISSING_VALUES = ("drop", "observed")
 
 
 def _missing_weights(
@@ -150,13 +170,14 @@ def _parameters_from_xprod(
 
 
 class SystemFormulaParser:
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         formula: Mapping[str, str] | str,
         data: DataFrame,
         weights: Mapping[str, linearmodels.typing.data.ArrayLike] | None = None,
         eval_env: int = 2,
         context: Mapping[str, Any] | None = None,
+        allow_missing_dependent: bool = False,
     ) -> None:
         if not isinstance(formula, (Mapping, str)):
             raise TypeError("formula must be a string or dictionary-like")
@@ -167,6 +188,7 @@ class SystemFormulaParser:
         self._weight_dict: dict[str, Series | None] = {}
         self._eval_env = eval_env
         self._clean_formula: dict[str, str] = {}
+        self._allow_missing_dependent = allow_missing_dependent
         if context is None:
             self._context = capture_context(eval_env)
         else:
@@ -207,7 +229,12 @@ class SystemFormulaParser:
             for formula_key in formula:
                 f = formula[formula_key]
                 f = self._prevent_autoconst(f)
-                parsers[formula_key] = IVFormulaParser(f, data, context=self._context)
+                parsers[formula_key] = IVFormulaParser(
+                    f,
+                    data,
+                    context=self._context,
+                    allow_missing_dependent=self._allow_missing_dependent,
+                )
 
                 if weights is not None:
                     if formula_key in weights:
@@ -239,7 +266,12 @@ class SystemFormulaParser:
                     key = base_key + f".{count}"
                     count += 1
                 assert isinstance(key, str)
-                parsers[key] = IVFormulaParser(f, data, context=self._context)
+                parsers[key] = IVFormulaParser(
+                    f,
+                    data,
+                    context=self._context,
+                    allow_missing_dependent=self._allow_missing_dependent,
+                )
                 cln_formula[key] = f
                 if weights is not None:
                     if key in weights:
@@ -353,12 +385,18 @@ class _SystemModelBase:
         ],
         *,
         sigma: linearmodels.typing.data.ArrayLike | None = None,
+        missing: Literal["drop", "observed"] = "drop",
     ) -> None:
         if not isinstance(equations, Mapping):
             raise TypeError("equations must be a dictionary-like")
         for key in equations:
             if not isinstance(key, str):
                 raise ValueError("Equation labels (keys) must be strings")
+        if missing not in OBSERVED_MISSING_VALUES:
+            raise ValueError(
+                f"missing must be either 'drop' or 'observed'; got {missing!r}."
+            )
+        self._missing = missing
 
         self._equations = equations
         self._sigma = None
@@ -392,6 +430,10 @@ class _SystemModelBase:
         self._has_constant: Series = Series(dtype=bool)
         self._common_exog = False
         self._original_index: Index | None = None
+        self._observed_mask: linearmodels.typing.data.BoolArray | None = None
+        self._empty_rows: linearmodels.typing.data.IntArray = np.empty(
+            0, dtype=np.int64
+        )
         self._model_name = "Three Stage Least Squares (3SLS)"
 
         self._validate_data()
@@ -406,6 +448,8 @@ class _SystemModelBase:
         self._formula = value
 
     def _validate_data(self) -> None:
+        if self._missing == "observed":
+            self._reject_observed_weights()
         ids = []
         for i, key in enumerate(self._equations):
             self._eq_labels.append(key)
@@ -485,7 +529,10 @@ class _SystemModelBase:
                     "{eq}".format(eq=self._eq_labels[i])
                 )
 
-        self._drop_missing()
+        if self._missing == "observed":
+            self._validate_observed_data()
+        else:
+            self._drop_missing()
         self._common_exog = len(set(ids)) == 1
         if self._common_exog:
             # Common exog requires weights are also equal
@@ -526,6 +573,10 @@ class _SystemModelBase:
             self._wz.append(z * w_sqrt)
             cols = list(exog_ivd.cols) + list(endog.cols)
             self._param_names.extend([label + "_" + col for col in cols])
+            if self._missing == "observed":
+                # Identification is assessed on each equation's actually
+                # observed design; see _validate_observed_data.
+                continue
             if y.shape[0] <= x.shape[1]:
                 raise ValueError(
                     "Fewer observations than variables in "
@@ -580,6 +631,165 @@ class _SystemModelBase:
                 self._endog[i].drop(missing)
                 self._instr[i].drop(missing)
                 self._weights[i].drop(missing)
+
+    def _reject_observed_weights(self) -> None:
+        for key, eq_data in self._equations.items():
+            has_weights = False
+            if isinstance(eq_data, (tuple, list)):
+                has_weights = len(eq_data) == 5
+            elif isinstance(eq_data, Mapping):
+                has_weights = "weights" in eq_data
+            if has_weights:
+                raise ObservedSURError(
+                    "Observation weights are not supported when "
+                    f'missing="observed" (equation {key!r}).'
+                )
+
+    def _validate_observed_data(self) -> None:
+        """Validate and retain all rows for missing='observed' models."""
+        k = len(self._dependent)
+        nobs = self._dependent[0].shape[0]
+        self._original_index = Index(self._dependent[0].rows)
+
+        # Common length and pandas index checks: data must align explicitly.
+        pandas_indexes = []
+        for i in range(k):
+            n_i = self._dependent[i].shape[0]
+            if n_i != nobs:
+                raise ObservedSURError(
+                    "All equations must have the same number of observations "
+                    f"when missing='observed'; equation {self._eq_labels[i]!r} "
+                    f"has {n_i} rows but the first equation has {nobs}."
+                )
+            dep_pd = self._dependent[i].pandas
+            if not dep_pd.index.is_unique:
+                raise ObservedSURError(
+                    f"The index of equation {self._eq_labels[i]!r} contains "
+                    "duplicate entries; pandas inputs must have unique indexes."
+                )
+            pandas_indexes.append(dep_pd.index)
+            # Every pandas component of the same equation must share the
+            # dependent's index exactly; no silent reindexing is allowed.
+            for component_name, ivd in (
+                ("exogenous", self._exog[i]),
+                ("endogenous", self._endog[i]),
+                ("instruments", self._instr[i]),
+            ):
+                if ivd.shape[1] == 0:
+                    continue
+                comp_index = ivd.pandas.index
+                if not comp_index.is_unique:
+                    raise ObservedSURError(
+                        f"The {component_name} index of equation "
+                        f"{self._eq_labels[i]!r} contains duplicate entries; "
+                        "pandas inputs must have unique indexes."
+                    )
+                if not comp_index.equals(dep_pd.index):
+                    raise ObservedSURError(
+                        f"The {component_name} variables of equation "
+                        f"{self._eq_labels[i]!r} do not share the dependent's "
+                        "pandas index. Align all inputs explicitly before "
+                        "constructing the model; no implicit reindexing is "
+                        "performed."
+                    )
+
+        first_index = pandas_indexes[0]
+        for i in range(1, k):
+            if not pandas_indexes[i].equals(first_index):
+                raise ObservedSURError(
+                    "All equations must share the same, identically ordered "
+                    f"pandas index when missing='observed'; equation "
+                    f"{self._eq_labels[i]!r} does not match the first "
+                    "equation. Align the inputs explicitly before constructing "
+                    "the model."
+                )
+
+        observed = np.zeros((nobs, k), dtype=bool)
+        for i in range(k):
+            label = self._eq_labels[i]
+            y = cast(
+                "linearmodels.typing.data.Float64Array",
+                self._dependent[i].ndarray,
+            )
+            if np.isinf(y).any():
+                raise ObservedSURError(
+                    f"Dependent variable of equation {label!r} contains an "
+                    "infinite value; infinite values are not permitted even "
+                    "when the cell is otherwise unobserved."
+                )
+            # NaN in the dependent alone marks an unobserved cell.
+            observed[:, i] = np.isfinite(y.squeeze(1))
+
+            for name, ivd in (
+                ("exogenous", self._exog[i]),
+                ("endogenous", self._endog[i]),
+                ("instruments", self._instr[i]),
+            ):
+                if ivd.shape[1] == 0:
+                    continue
+                arr = cast("linearmodels.typing.data.Float64Array", ivd.ndarray)
+                if not np.isfinite(arr).all():
+                    raise ObservedSURError(
+                        f"The {name} variables of equation {label!r} contain "
+                        "missing or infinite values. With missing='observed', "
+                        "only dependent-variable NaNs may denote unobserved "
+                        "cells, and the check applies to every row regardless "
+                        "of whether the dependent is observed."
+                    )
+
+        if not observed.any():
+            raise ObservedSURError(
+                "Every dependent cell is missing; the model contains no "
+                "observations and cannot be fit."
+            )
+        self._observed_mask = observed
+        # Rows where no equation contributes any likelihood term. They remain
+        # in every data array and in all outputs but never enter estimation.
+        self._empty_rows = np.flatnonzero(~observed.any(axis=1))
+
+        # Per-equation identification on the equation's observed design.
+        for i in range(k):
+            rows = np.flatnonzero(observed[:, i])
+            n_i = rows.shape[0]
+            x = np.concatenate(
+                [self._exog[i].ndarray, self._endog[i].ndarray], 1, dtype=float
+            )
+            if n_i == 0:
+                raise ObservedSURError(
+                    f"Equation {self._eq_labels[i]!r} has no observed "
+                    "dependent values and cannot be estimated."
+                )
+            if n_i <= x.shape[1]:
+                raise ObservedSURError(
+                    f"Equation {self._eq_labels[i]!r} has {n_i} observed "
+                    f"rows but {x.shape[1]} regressors; it is not identified."
+                )
+            if matrix_rank(x[rows]) < x.shape[1]:
+                raise ObservedSURError(
+                    f"Equation {self._eq_labels[i]!r}'s observed design "
+                    "matrix is not full rank."
+                )
+
+        if self._sigma is not None:
+            check_known_sigma(self._sigma, k)
+
+    @property
+    def missing(self) -> str:
+        """Missing-observation handling mode ('drop' or 'observed')."""
+        return self._missing
+
+    @property
+    def observed_mask(self) -> DataFrame:
+        """Boolean frame marking observed dependent cells (observed mode)."""
+        if self._missing != "observed":
+            raise AttributeError(
+                "observed_mask is only available when missing='observed'."
+            )
+        return DataFrame(
+            self._observed_mask,
+            index=self._original_index,
+            columns=self._eq_labels,
+        )
 
     def __repr__(self) -> str:
         return self.__str__() + f"\nid: {hex(id(self))}"
@@ -1224,6 +1434,11 @@ class _SystemModelBase:
         The property `param_names` can be used to determine the order of
         parameters.
         """
+        if self._missing == "observed":
+            raise ObservedSURError(
+                "Linear parameter constraints are not supported with "
+                'missing="observed".'
+            )
         self._constraints = LinearConstraint(
             r, q=q, num_params=len(self._param_names), require_pandas=True
         )
@@ -1610,6 +1825,12 @@ class SUR(_LSSystemModelBase):
     sigma : array_like
         Prespecified residual covariance to use in GLS estimation. If not
         provided, FGLS is implemented based on an estimate of sigma.
+    missing : {"drop", "observed"}
+        How to handle NaN values in the dependent variables. The default
+        ``"drop"`` removes every row containing a missing value in any
+        equation before estimation. ``"observed"`` keeps the original rows
+        and fits the joint Gaussian likelihood of the dependent cells that
+        are actually observed; see the notes and :meth:`fit` for details.
 
     Notes
     -----
@@ -1669,6 +1890,17 @@ class SUR(_LSSystemModelBase):
 
     SUR is a special case of 3SLS where there are no endogenous regressors and
     no instruments.
+
+    With ``missing="observed"`` the missing dependent cells are never
+    imputed. The fit maximizes the observed-data normal likelihood: rows are
+    independent, equations observed within a row share the constant
+    cross-equation covariance :math:`\Sigma`, and a missing dependent simply
+    contributes no density term. Rows where every dependent is missing remain
+    in the data but never enter the likelihood. If ``sigma`` is supplied it is
+    treated as known (and must be finite, symmetric and positive definite);
+    otherwise the coefficients and a positive-definite :math:`\Sigma` are
+    estimated jointly. This mode requires ``fit(method="ml")`` and does not
+    support observation weights or linear parameter constraints.
     """
 
     def __init__(
@@ -1680,6 +1912,7 @@ class SUR(_LSSystemModelBase):
         ],
         *,
         sigma: linearmodels.typing.data.ArrayLike | None = None,
+        missing: Literal["drop", "observed"] = "drop",
     ) -> None:
         if not isinstance(equations, Mapping):
             raise TypeError("equations must be a dictionary-like")
@@ -1697,8 +1930,283 @@ class SUR(_LSSystemModelBase):
                 else:
                     eqn = (*eqn, None, None)
             reformatted[key] = eqn
-        super().__init__(reformatted, sigma=sigma)
+        super().__init__(reformatted, sigma=sigma, missing=missing)
         self._model_name = "Seemingly Unrelated Regression (SUR)"
+
+    def fit(  # type: ignore[override]
+        self,
+        *,
+        method: Optional[Literal["ols", "gls", "ml"]] = None,
+        full_cov: bool = True,
+        iterate: bool = False,
+        iter_limit: int = 100,
+        tol: float = 1e-6,
+        cov_type: str = "robust",
+        **cov_config: bool,
+    ) -> SystemResults:
+        """
+        Estimate model parameters
+
+        Parameters
+        ----------
+        method : {None, "ols", "gls", "ml"}
+            Estimation method.  The default ``None`` selects GLS.  Models
+            built with ``missing="observed"`` require ``"ml"`` and maximize
+            the joint normal likelihood of the observed dependent cells;
+            ``"ols"`` and ``"gls"`` raise an error in that mode.
+        full_cov : bool
+            Flag indicating to use the full residual covariance when
+            estimating GLS parameters.  Ignored by the observed-data ML path.
+        iterate : bool
+            Flag indicating to iterate GLS.  Ignored by the observed-data ML
+            path.
+        iter_limit : int
+            Maximum number of likelihood optimizer iterations.
+        tol : float
+            Convergence tolerance applied to the analytic likelihood score.
+        cov_type : str
+            Covariance estimator.  The observed-data ML path supports
+            ``"unadjusted"`` (inverse observed information) and
+            ``"robust"`` (row-score sandwich); other estimators are rejected.
+        **cov_config
+            Additional covariance options.  Debiased estimation and kernel
+            or clustered covariances are not supported with
+            ``missing="observed"``.
+        """
+        if self._missing == "observed":
+            if method != "ml":
+                raise ObservedSURError(
+                    'Models constructed with missing="observed" only support '
+                    'fit(method="ml"). The OLS and GLS estimators require '
+                    "complete rectangular data."
+                )
+            return self._fit_observed_ml(
+                iter_limit=iter_limit,
+                tol=tol,
+                cov_type=cov_type,
+                cov_config=cov_config,
+            )
+        drop_method: Optional[Literal["ols", "gls"]] = (
+            None if method is None or method == "ml" else method
+        )
+        return super().fit(
+            method=drop_method,
+            full_cov=full_cov,
+            iterate=iterate,
+            iter_limit=iter_limit,
+            tol=tol,
+            cov_type=cov_type,
+            **cov_config,
+        )
+
+    def _fit_observed_ml(
+        self,
+        *,
+        iter_limit: int,
+        tol: float,
+        cov_type: str,
+        cov_config: dict[str, bool],
+    ) -> SystemResults:
+        if iter_limit <= 0:
+            raise ValueError("iter_limit must be a positive integer.")
+        if tol <= 0.0:
+            raise ValueError("tol must be strictly positive.")
+        if self._constraints is not None:
+            raise ObservedSURError(
+                "Linear parameter constraints are not supported with "
+                'missing="observed".'
+            )
+        normalized = cov_type.lower()
+        if normalized not in COV_TYPES or COV_TYPES[normalized] not in (
+            "unadjusted",
+            "robust",
+        ):
+            raise ValueError(
+                'missing="observed" supports cov_type "unadjusted" and '
+                f'"robust" only; got {cov_type!r}.'
+            )
+        cov_type = COV_TYPES[normalized]
+        debiased = bool(cov_config.pop("debiased", False))
+        if debiased:
+            raise ValueError(
+                "Debiased covariance estimation is not supported with "
+                'missing="observed".'
+            )
+        if cov_config:
+            key = next(iter(cov_config))
+            raise ValueError(
+                f"Unsupported covariance configuration {key!r}; observed-data "
+                "ML accepts no additional covariance options."
+            )
+
+        assert self._observed_mask is not None
+        ml_result = fit_observed_sur(
+            self._x,
+            self._y,
+            self._observed_mask,
+            sigma=self._sigma,
+            iter_limit=iter_limit,
+            tol=tol,
+        )
+        return self._finalize_observed_ml(ml_result, cov_type)
+
+    def _finalize_observed_ml(self, ml_result: Any, cov_type: str) -> SystemResults:
+        k = len(self._x)
+        beta = ml_result.params
+        sigma = ml_result.sigma
+        n = self._x[0].shape[0]
+        known_sigma = ml_result.known_sigma
+
+        cov_cls = OBSERVED_COV_EST[cov_type]
+        cov_est = cov_cls(
+            n_params=beta.shape[0],
+            hessian=ml_result.hessian,
+            row_scores=ml_result.row_scores,
+            known_sigma=known_sigma,
+        )
+        cov = cov_est.cov
+
+        # Residuals and fitted values retain every original row; unobserved
+        # cells stay NaN and are never conditionally filled from other eqs.
+        resid_full = ml_result.residuals.copy()
+        fitted_full = np.full((n, k), np.nan)
+        loc = 0
+        for i in range(k):
+            nb = self._x[i].shape[1]
+            b = beta[loc : loc + nb]
+            fitted_full[:, i] = (self._x[i] @ b).squeeze(1)
+            loc += nb
+
+        assert self._observed_mask is not None
+        individual = AttrDict()
+        for i in range(k):
+            cons = bool(self.has_constant.iloc[i])
+            observed_i = self._observed_mask[:, i]
+            yi = self._y[i][observed_i]
+            if cons:
+                ye = yi - yi.mean()
+            else:
+                ye = yi
+            total_ss = float((ye.T @ ye).squeeze())
+            stats = self._observed_indiv_results(
+                i,
+                beta,
+                cov,
+                resid_full,
+                fitted_full,
+                cov_type,
+                cov_est,
+                total_ss,
+                cons,
+                int(ml_result.nobs_per_eq[i]),
+            )
+            individual[self._eq_labels[i]] = stats
+
+        # System nobs is the sum of the per-equation observed counts.
+        results = AttrDict()
+        results["method"] = "ML (observed data)"
+        results["iter"] = ml_result.iter_count
+        results["nobs"] = int(ml_result.nobs_total)
+        results["cov_type"] = cov_type
+        results["index"] = self._dependent[0].rows
+        results["original_index"] = self._original_index
+        names = list(individual.keys())
+        results["sigma"] = DataFrame(sigma, columns=names, index=names)
+        results["individual"] = individual
+        results["params"] = beta
+        results["df_model"] = beta.shape[0]
+        results["param_names"] = self._param_names
+        results["cov"] = cov
+        results["debiased"] = False
+        results["resid_ss"] = float(np.nansum(resid_full * resid_full))
+        results["total_ss"] = float(sum(individual[key].total_ss for key in individual))
+        # R2 over observed cells only; no zeros replace missing residuals.
+        results["r2"] = 1.0 - results["resid_ss"] / results["total_ss"]
+        results["resid"] = resid_full
+        results["constraints"] = None
+        results["model"] = self
+        results["fitted"] = fitted_full
+        results["wresid"] = resid_full
+        results["cov_estimator"] = cov_est
+        results["cov_config"] = cov_est.cov_config
+        results["loglik"] = ml_result.loglik
+        results["converged"] = ml_result.converged
+        results["termination"] = ml_result.termination
+        results["score_norm"] = ml_result.score_norm
+        results["iter_limit_tol"] = ml_result.tol
+        results["known_sigma"] = known_sigma
+        results["observed_mask"] = self._observed_mask
+        results["empty_rows"] = self._empty_rows
+        results["nobs_per_eq"] = ml_result.nobs_per_eq
+        results["full_information"] = ml_result.hessian
+        results["row_scores"] = ml_result.row_scores
+        results["score_rows"] = ml_result.score_rows
+        # Likelihood engine retained for diagnostics and advanced checks.
+        self._fit_engine_likelihood = ml_result.extra["likelihood"]
+        # Rectangular-residual system fit measures are not defined with holes.
+        results["system_r2"] = Series(
+            np.full(4, np.nan),
+            index=["mcelroy", "berndt", "judge", "dhrymes"],
+        )
+        return ObservedSURResults(results)
+
+    def _observed_indiv_results(  # noqa: PLR0917
+        self,
+        index: int,
+        beta: linearmodels.typing.data.Float64Array,
+        cov: linearmodels.typing.data.Float64Array,
+        resid_full: linearmodels.typing.data.Float64Array,
+        fitted_full: linearmodels.typing.data.Float64Array,
+        cov_type: str,
+        cov_est: Any,
+        total_ss: float,
+        constant: bool,
+        nobs: int,
+    ) -> AttrDict:
+        loc = 0
+        for i in range(index):
+            loc += self._x[i].shape[1]
+        i = index
+        df = self._x[i].shape[1]
+        b = beta[loc : loc + df]
+        stats = AttrDict()
+        stats["eq_label"] = self._eq_labels[i]
+        stats["dependent"] = self._dependent[i].cols[0]
+        stats["instruments"] = None
+        stats["endog"] = None
+        stats["method"] = "ML (observed data)"
+        stats["cov_type"] = cov_type
+        stats["cov_estimator"] = cov_est
+        stats["cov_config"] = cov_est.cov_config
+        stats["weight_estimator"] = None
+        stats["index"] = self._dependent[i].rows
+        stats["original_index"] = self._original_index
+        stats["iter"] = 0
+        stats["debiased"] = False
+        stats["has_constant"] = constant
+        assert self._constant_loc is not None
+        stats["constant_loc"] = self._constant_loc[i]
+        stats["params"] = b
+        stats["cov"] = cov[loc : loc + df, loc : loc + df]
+        stats["wresid"] = resid_full[:, [i]]
+        stats["nobs"] = nobs
+        stats["df_model"] = df
+        stats["resid"] = resid_full[:, [i]]
+        stats["fitted"] = fitted_full[:, [i]]
+        assert self._observed_mask is not None
+        observed = self._observed_mask[:, i]
+        ei = resid_full[observed, i]
+        stats["resid_ss"] = float(ei @ ei)
+        stats["total_ss"] = total_ss
+        stats["r2"] = 1.0 - stats["resid_ss"] / stats["total_ss"]
+        df_c = nobs - int(constant)
+        df_r = nobs - df
+        stats["r2a"] = 1.0 - (stats["resid_ss"] / df_r) / (stats["total_ss"] / df_c)
+        names = self._param_names[loc : loc + df]
+        offset = len(stats.eq_label) + 1
+        stats["param_names"] = [nm[offset:] for nm in names]
+        stats["f_stat"] = self._f_stat(stats, False)
+        return stats
 
     @classmethod
     def multivariate_ls(
@@ -1757,6 +2265,7 @@ class SUR(_LSSystemModelBase):
         *,
         sigma: linearmodels.typing.data.ArrayLike | None = None,
         weights: Mapping[str, linearmodels.typing.data.ArrayLike] | None = None,
+        missing: Literal["drop", "observed"] = "drop",
     ) -> SUR:
         """
         Specify a SUR using the formula interface
@@ -1777,6 +2286,10 @@ class SUR(_LSSystemModelBase):
             weights.  Each entry must have the same number of observations as
             data.  If an equation label is not a key weights, the weights will
             be set to unity
+        missing : {"drop", "observed"}
+            Missing-value handling.  ``"observed"`` retains NaN dependent
+            cells as unobserved and requires ``fit(method="ml")``; see the
+            class documentation for the supported data requirements.
 
         Returns
         -------
@@ -1813,9 +2326,15 @@ class SUR(_LSSystemModelBase):
         >>> mod = SUR.from_formula(formula, data)
         """
         context = capture_context(1)
-        parser = SystemFormulaParser(formula, data, weights, context=context)
+        parser = SystemFormulaParser(
+            formula,
+            data,
+            weights,
+            context=context,
+            allow_missing_dependent=missing == "observed",
+        )
         eqns = parser.data
-        mod = cls(eqns, sigma=sigma)
+        mod = cls(eqns, sigma=sigma, missing=missing)
         mod.formula = formula
         return mod
 

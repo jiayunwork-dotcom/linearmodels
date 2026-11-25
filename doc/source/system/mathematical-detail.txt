@@ -476,3 +476,61 @@ each equation,
 
 where :math:`R_{i}^{2}` is the coefficient of determination from
 equation :math:`i`.
+
+Observed-data likelihood with missing dependents
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When the model is constructed with ``missing="observed"`` no rows are
+discarded.  Let :math:`M_r\subseteq\{1,\ldots,K\}` be the set of equations
+whose dependent is observed in row :math:`r`, and let :math:`e_{r,i}=
+y_{r,i}-x_{r,i}\beta_i`.  Rows are independent and the within-row error
+vector is Gaussian with a constant, equation-level covariance
+:math:`\Sigma`.  The marginal covariance of the observed sub-vector is
+the sub-matrix :math:`\Sigma_{M_r}=\Sigma[M_r,M_r]` (with precision
+:math:`V_{M_r}=\Sigma_{M_r}^{-1}`, the inverse of the sub-matrix rather
+than a sub-matrix of the full inverse), so the observed-data log
+likelihood is
+
+.. math::
+
+   \ell(\beta,\Sigma)=-\frac12\sum_{r:M_r\neq\varnothing}
+       \left(|M_r|\log(2\pi)+\log|\Sigma_{M_r}|
+       +e_{r,M_r}^{\prime}V_{M_r}e_{r,M_r}\right).
+
+Rows with :math:`M_r=\varnothing` contribute no term and are retained only
+to preserve the original layout; missing cells are never imputed.  Rows
+sharing the same observation pattern are processed together on dense
+sub-matrices, so the estimator never forms a global dense block design or
+a dense covariance of total-observation size.  The largest dense factored
+matrix is the observed information of the
+:math:`(\beta,\operatorname{vech}\Sigma)` parameter vector.
+
+If :math:`\Sigma` is supplied it is treated as known and :math:`\beta`
+solves the pattern-wise GLS normal equations
+:math:`\sum_r X_{r,M_r}^{\prime}V_{M_r}X_{r,M_r}\beta=
+\sum_r X_{r,M_r}^{\prime}V_{M_r}y_{r,M_r}`.  Otherwise :math:`\beta` and
+a positive-definite :math:`\Sigma` are estimated jointly.  The iteration
+starts from per-equation OLS coefficients and observed residual moment
+matrices, uses alternating pattern-wise GLS and covariance updates as a
+warm start, and finishes with L-BFGS-B over :math:`(\beta,
+\operatorname{vech}\Sigma)` followed by damped Newton steps that use the
+exact analytic observed information.  Convergence is declared only when
+the maximum absolute component of the analytic score is below the
+effective threshold derived from ``tol`` (and the iteration limit has not
+been reached); exhausting the budget, leaving the positive-definite cone
+toward a singular covariance, or producing a singular information matrix
+raises an explicit convergence error.  The optimizer termination message,
+the achieved score norm and the tolerance are all exposed on the results
+object so the stopping decision is auditable.
+
+Inference uses two estimators, both without small-sample adjustments.
+The ``"unadjusted"`` covariance is the inverse observed information of
+the full likelihood; when :math:`\Sigma` is estimated its coefficient
+block therefore includes the nuisance-parameter cross terms instead of
+treating the estimated covariance as known.  The ``"robust"`` covariance
+is a sandwich :math:`\mathcal{I}^{-1}J\mathcal{I}^{-1}` where each
+non-empty original row contributes one score vector combining every
+equation observed in that row.  Statistics that require a complete
+rectangular residual matrix are not defined in this mode and are reported
+as invalid rather than computed after replacing missing residuals with
+zeros.

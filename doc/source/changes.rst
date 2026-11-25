@@ -1,6 +1,8 @@
 Change Log
 ==========
 
+.. include:: changes/next.rst
+
 .. include:: changes/7.0.rst
 
 =============

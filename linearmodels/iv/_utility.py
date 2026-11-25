@@ -93,10 +93,14 @@ class IVFormulaParser:
         data: DataFrame,
         eval_env: int = 2,
         context: Mapping[str, Any] | None = None,
+        allow_missing_dependent: bool = False,
     ):
         self._formula = formula
         self._data = data
         self._eval_env = eval_env
+        # When True, NaNs in the dependent variable are retained so that an
+        # observed-data likelihood can treat them as unobserved cells.
+        self._allow_missing_dependent = allow_missing_dependent
         if not context:
             self._context = capture_context(context=self._eval_env)
         else:
@@ -170,12 +174,15 @@ class IVFormulaParser:
     def dependent(self) -> DataFrame:
         """Dependent variable"""
         dep_fmla = self.components["dependent"]
+        na_action = (
+            fNAAction("ignore") if self._allow_missing_dependent else fNAAction("raise")
+        )
         dep = model_matrix(
             dep_fmla,
             self._data,
             context=self._context,
             ensure_full_rank=False,
-            na_action=fNAAction("raise"),
+            na_action=na_action,
         )
         return DataFrame(dep)
 

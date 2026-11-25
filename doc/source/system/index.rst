@@ -72,6 +72,55 @@ SUR which allows variables to be either exogenous or endogenous, and when there 
 variables, for instruments to be used.  SUR is a special case of 3SLS where there are no
 endogenous variables or instruments. 3SLS allows systems of IV equations to be jointly estimated.
 
+Partially observed dependent data
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default any row with a missing value in any equation is dropped before
+estimation (``missing="drop"``).  :class:`~linearmodels.system.model.SUR`
+also supports ``missing="observed"``, which keeps every row and fits the
+joint Gaussian likelihood of the dependent cells that are actually
+observed.  Rows remain independent, equations observed within a row retain
+their cross-equation covariance :math:`\Sigma`, and a NaN dependent simply
+contributes no density rather than being imputed.  Rows where every
+dependent is missing stay in the data layout but never enter the
+likelihood.
+
+.. code-block:: python
+
+  import numpy as np
+  from linearmodels.system import SUR
+
+  # equations is an OrderedDict of {"dependent": y, "exog": x} entries;
+  # NaNs in a dependent mark that cell as unobserved.
+  mod = SUR(equations, missing="observed")
+  res = mod.fit(method="ml")
+
+The observed-data path is maximum-likelihood only
+(``fit(method="ml")``); the OLS and GLS estimators require complete
+rectangular data.  If ``sigma`` is supplied it is treated as known and
+must be finite, symmetric and positive definite, otherwise the
+coefficients and a positive-definite :math:`\Sigma` are estimated jointly.
+Two covariance estimators are available, both without small-sample
+adjustments: ``cov_type="unadjusted"`` uses the inverse observed
+information of the full likelihood (including the coefficient / covariance
+nuisance blocks when :math:`\Sigma` is estimated), and
+``cov_type="robust"`` uses a sandwich built from row-level scores that
+combine every equation observed in that row.
+
+Only NaNs in a dependent variable denote unobserved cells.  Missing or
+infinite regressors and infinite dependent values raise an error even when
+the corresponding dependent would otherwise be missing, and all equations
+must share the same length and, for pandas inputs, the same unique index
+in the same order.  Observation weights and linear parameter constraints
+are not supported in this mode.  Results preserve the original row layout:
+residuals are NaN in unobserved cells while fitted values (the conditional
+mean :math:`x\beta`) are reported for every row and equation, and no
+information from other equations is used to fill missing values.
+Test statistics that require a complete rectangular residual matrix (for
+example the Breusch-Pagan and diagonal-covariance likelihood-ratio tests)
+are returned as invalid rather than silently replacing missing residuals
+with zeros.
+
 .. toctree::
    :maxdepth: 1
    :glob:
